@@ -1,6 +1,26 @@
 #pragma once
 
 /*
+
+Tagged allocator. Tracks allocations with size, time, tag (4 chars), and the pointer.
+
+Written by Graham Sutherland.
+Released under MIT license - see MIT-LICENSE.txt for full text.
+
+Example usage:
+
+	T* obj = TaggedAlloc::Allocate<T>("abcd");
+	T* array = TaggedAlloc::AllocateArray<T>(10, "abcd");
+	size_t numberOfActiveAllocations = TaggedAlloc::GetAllocationCount();
+	TaggedAlloc::PrintStats();
+	TaggedAlloc::Free(obj);
+	TaggedAlloc::Free(array);
+
+*/
+
+/*
+This code requires some specific mutex features!
+
 Put this in your %AppData%\Local\Arduino15\packages\esp32\hardware\esp32\platform.local.txt:
 
 extras.defines=-DconfigSUPPORT_STATIC_ALLOCATION=1 -DconfigUSE_RECURSIVE_MUTEXES=1 -DCONFIG_SUPPORT_STATIC_ALLOCATION=1 -DconfigUSE_MUTEXES=1 -DconfigUSE_RECURSIVE_MUTEXES=1 -DconfigUSE_COUNTING_SEMAPHORES=1

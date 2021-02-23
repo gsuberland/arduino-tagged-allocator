@@ -1,28 +1,39 @@
 #pragma once
 
+#include "pch.h"
+
 /*
+ * Tagged allocator. Tracks allocations with size, time, tag (4 chars), and the pointer.
+ * Written by Graham Sutherland
+ * Released under MIT license - see MIT-LICENSE.txt for full text.
+ * https://github.com/gsuberland/arduino-tagged-allocator/
+ * 
+ */
 
-Tagged allocator. Tracks allocations with size, time, tag (4 chars), and the pointer.
-
-Written by Graham Sutherland.
-Released under MIT license - see MIT-LICENSE.txt for full text.
-
+/*
 Example usage:
 
-	TaggedAlloc::Init();
-	T* obj = TaggedAlloc::Allocate<T>("abcd");
-	T* array = TaggedAlloc::AllocateArray<T>(10, "abcd");
-	size_t numberOfActiveAllocations = TaggedAlloc::GetAllocationCount();
-	TaggedAlloc::PrintStats();
-	TaggedAlloc::Free(obj);
-	TaggedAlloc::Free(array);
+  TaggedAlloc::Init();
+  SomeType* obj = TaggedAlloc::Allocate<SomeType>("abcd");
+  float* array = TaggedAlloc::AllocateArray<float>(32, "FlAr");
+  size_t numberOfActiveAllocations = TaggedAlloc::GetAllocationCount();
+  size_t sizeOfAllocations = TaggedAlloc::GetTotalSize();
+  TaggedAlloc::PrintStats();
+  TaggedAlloc::Free(obj);
+  TaggedAlloc::Free(array);
 
 */
 
 /*
-This code requires some specific mutex features!
+ * NOTE: 
+ * The current memory allocation failure policy is to throw an assertion failure. This ensures quick clean failure in the case where something goes wrong.
+ * This may not be ideal for all circumstances, e.g. speculative allocation of large buffers to see if there's enough memory to perform an action.
+ * Future versions of this code will include a global policy option and per-call "don't panic" flag.
+ */
 
-Put this in your %AppData%\Local\Arduino15\packages\esp32\hardware\esp32\platform.local.txt:
+/*
+ * NOTE: This code requires some specific mutex features!
+ * Put this in your %AppData%\Local\Arduino15\packages\esp32\hardware\esp32\platform.local.txt:
 
 extras.defines=-DconfigSUPPORT_STATIC_ALLOCATION=1 -DconfigUSE_RECURSIVE_MUTEXES=1 -DCONFIG_SUPPORT_STATIC_ALLOCATION=1 -DconfigUSE_MUTEXES=1 -DconfigUSE_RECURSIVE_MUTEXES=1 -DconfigUSE_COUNTING_SEMAPHORES=1
 build.defines={extras.defines}
@@ -31,19 +42,21 @@ compiler.c.elf.extra_flags={extras.defines}
 compiler.c.extra_flags={extras.defines}
 compiler.S.extra_flags={extras.defines}
 
-This enables the FreeRTOS mutex features needed for this code.
+ * This enables the FreeRTOS mutex features needed for this code.
+ */
 
-*/
+/* 
+ * WARNING:
+ * Static mutex initialisation is currently broken for arduino-esp32, due to missing xQueueCreateMutexStatic.
+ * See: https://github.com/espressif/arduino-esp32/issues/4851
+ * This means that we must dynamically allocate a mutex at the Init() call. This means that Init() can fail if memory is very low when it is called.
+ * For now this is just accepted, there's nothing we can do.
+ * 
+ */
 
-#define CONFIG_SUPPORT_STATIC_ALLOCATION
-#define configSUPPORT_STATIC_ALLOCATION 1
-#define configSUPPORT_DYNAMIC_ALLOCATION 1
-#define configUSE_MUTEXES 1
-#define configUSE_RECURSIVE_MUTEXES 1
-#define configUSE_COUNTING_SEMAPHORES 1
-#include <freertos/FreeRTOS.h>
-#include <freertos/queue.h>
-#include <freertos/semphr.h>
+/*****************
+ * Configuration *
+ *****************/
 
 // the minimum size of the allocation table (in entires)
 #ifndef TAGGED_ALLOC_MIN_TABLE_SIZE
@@ -75,12 +88,23 @@ This enables the FreeRTOS mutex features needed for this code.
 // uncomment this if you want to save a little bit of memory (and some millis() calls) by not tracking the allocation time
 //#define TAGGED_ALLOC_NO_TIME_TRACKING
 
+
+/**********
+ * Macros *
+ **********/
+
 // macro to check if a particular TaggedAllocationDescriptor is valid
 #define TAGGED_ALLOC_IS_VALID(t) ((t).Object != nullptr)
+
+
+/********************
+ * Class definition *
+ ********************/
 
 class TaggedAlloc
 {  
 private:
+  // internal descriptor struct for allocations
   struct TaggedAllocationDescriptor
   {
     void* Object;
@@ -148,6 +172,8 @@ public:
   }
   
   static size_t GetAllocationCount();
+
+  static size_t GetTotalSize();
   
   static void PrintStats();
 
@@ -162,7 +188,48 @@ public:
 };
 
 
+/************************
+ * Static variable init *
+ ************************/
 
+volatile bool TaggedAlloc::InitOK = false;
+volatile size_t TaggedAlloc::AllocationCount = 0;
+volatile size_t TaggedAlloc::AllocationTableSize = TAGGED_ALLOC_INITIAL_TABLE_SIZE;
+TaggedAlloc::TaggedAllocationDescriptor* TaggedAlloc::AllocationTable = nullptr;
+SemaphoreHandle_t TaggedAlloc::AllocationTableMutex = nullptr;
+//StaticSemaphore_t TaggedAlloc::AllocationTableMutexStatic;
+
+
+/********************
+ * Public functions *
+ ********************/
+
+// allocate a thing
+template<typename T>
+T* TaggedAlloc::Allocate(char tag[4])
+{
+  return AllocateInternal<T>(1, tag);
+}
+
+
+// allocate an array of things
+template<typename T>
+T* TaggedAlloc::AllocateArray(size_t count, char tag[4])
+{
+  return AllocateInternal<T>(count, tag);
+}
+
+// free the thing
+template<typename T>
+void TaggedAlloc::Free(T* object)
+{
+  // remove the allocation from the table, then free the object
+  RemoveAllocation((void*)object);
+  free(object);
+}
+
+
+// how many allocations do we have?
 size_t TaggedAlloc::GetAllocationCount()
 {
   assert(xSemaphoreTake(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME));
@@ -175,6 +242,27 @@ size_t TaggedAlloc::GetAllocationCount()
 }
 
 
+// what's the sum of the size of all the allocations?
+size_t TaggedAlloc::GetTotalSize()
+{
+  assert(xSemaphoreTake(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME));
+  
+  size_t totalSize = 0;
+  for (size_t index = 0; index < AllocationTableSize; index++)
+  {
+    if (TAGGED_ALLOC_IS_VALID(AllocationTable[index]))
+    {
+      totalSize += AllocationTable[index].Size;
+    }
+  }
+  
+  xSemaphoreGive(AllocationTableMutex);
+  
+  return totalSize;
+}
+
+
+// show some stats over serial output
 void TaggedAlloc::PrintStats()
 {
   Serial.println("*** TAGGED ALLOCATION STATS ***");
@@ -221,6 +309,10 @@ void TaggedAlloc::PrintStats()
   free(allocationTableCopy);
 }
 
+
+/*********************
+ * Private functions *
+ *********************/
 
 bool TaggedAlloc::GetFirstEmptySlot(size_t* index)
 {
@@ -431,36 +523,3 @@ T* TaggedAlloc::AllocateInternal(size_t count, char tag[4])
   // done :)
   return (T*)ta.Object;
 }
-
-
-// allocate a thing
-template<typename T>
-T* TaggedAlloc::Allocate(char tag[4])
-{
-  return AllocateInternal<T>(1, tag);
-}
-
-
-// allocate an array of things
-template<typename T>
-T* TaggedAlloc::AllocateArray(size_t count, char tag[4])
-{
-  return AllocateInternal<T>(count, tag);
-}
-
-// free the thing
-template<typename T>
-void TaggedAlloc::Free(T* object)
-{
-  // remove the allocation from the table, then free the object
-  RemoveAllocation((void*)object);
-  free(object);
-}
-
-
-volatile bool TaggedAlloc::InitOK = false;
-volatile size_t TaggedAlloc::AllocationCount = 0;
-volatile size_t TaggedAlloc::AllocationTableSize = TAGGED_ALLOC_INITIAL_TABLE_SIZE;
-TaggedAlloc::TaggedAllocationDescriptor* TaggedAlloc::AllocationTable = nullptr;
-SemaphoreHandle_t TaggedAlloc::AllocationTableMutex = nullptr;
-//StaticSemaphore_t TaggedAlloc::AllocationTableMutexStatic;

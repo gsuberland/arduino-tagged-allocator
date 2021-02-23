@@ -7,6 +7,7 @@ TaggedAlloc::Init();
 SomeType* obj = TaggedAlloc::Allocate<SomeType>("abcd");
 float* array = TaggedAlloc::AllocateArray<float>(32, "FlAr");
 size_t numberOfActiveAllocations = TaggedAlloc::GetAllocationCount();
+size_t sizeOfAllocations = TaggedAlloc::GetTotalSize();
 TaggedAlloc::PrintStats();
 TaggedAlloc::Free(obj);
 TaggedAlloc::Free(array);

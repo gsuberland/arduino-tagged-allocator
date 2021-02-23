@@ -3,6 +3,7 @@
 A memory allocator wrapper for Arduino/FreeRTOS that keeps a table of descriptors and tags for active allocations, similar to ExAllocatePoolWithTag in the Windows kernel.
 
 ```cpp
+TaggedAlloc::Init();
 SomeType* obj = TaggedAlloc::Allocate<SomeType>("abcd");
 float* array = TaggedAlloc::AllocateArray<float>(32, "FlAr");
 size_t numberOfActiveAllocations = TaggedAlloc::GetAllocationCount();

@@ -9,6 +9,7 @@ Released under MIT license - see MIT-LICENSE.txt for full text.
 
 Example usage:
 
+	TaggedAlloc::Init();
 	T* obj = TaggedAlloc::Allocate<T>("abcd");
 	T* array = TaggedAlloc::AllocateArray<T>(10, "abcd");
 	size_t numberOfActiveAllocations = TaggedAlloc::GetAllocationCount();

@@ -156,7 +156,9 @@ public:
      *  You can solve this by calling Init() in your setup function, rather than trying to lazily initialise in tasks or something weird.
      */
     if (InitOK)
+    {
       return;
+    }
 
     // normally I'd use static allocation here, but arduino-esp32 didn't include the static implementations.
     // see: https://github.com/espressif/arduino-esp32/issues/4851
@@ -219,6 +221,7 @@ T* TaggedAlloc::AllocateArray(size_t count, char tag[4])
   return AllocateInternal<T>(count, tag);
 }
 
+
 // free the thing
 template<typename T>
 void TaggedAlloc::Free(T* object)
@@ -232,11 +235,11 @@ void TaggedAlloc::Free(T* object)
 // how many allocations do we have?
 size_t TaggedAlloc::GetAllocationCount()
 {
-  assert(xSemaphoreTake(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME));
+  assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
   
   volatile size_t count = AllocationCount;
   
-  xSemaphoreGive(AllocationTableMutex);
+  xSemaphoreGiveRecursive(AllocationTableMutex);
 
   return count;
 }
@@ -245,7 +248,7 @@ size_t TaggedAlloc::GetAllocationCount()
 // what's the sum of the size of all the allocations?
 size_t TaggedAlloc::GetTotalSize()
 {
-  assert(xSemaphoreTake(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME));
+  assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
   
   size_t totalSize = 0;
   for (size_t index = 0; index < AllocationTableSize; index++)
@@ -256,7 +259,7 @@ size_t TaggedAlloc::GetTotalSize()
     }
   }
   
-  xSemaphoreGive(AllocationTableMutex);
+  xSemaphoreGiveRecursive(AllocationTableMutex);
   
   return totalSize;
 }
@@ -267,14 +270,29 @@ void TaggedAlloc::PrintStats()
 {
   Serial.println("*** TAGGED ALLOCATION STATS ***");
   Serial.println("> Capturing allocation table...");
-  
-  // capture a copy of the allocation table
-  assert(xSemaphoreTake(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME));
-  volatile size_t tableSize = AllocationTableSize * sizeof(TaggedAllocationDescriptor);
-  volatile size_t allocCount = AllocationCount;
+
+  // calls to Serial functions may take a lot of time, so it isn't practical to hold the lock on the descriptor table while we print stats.
+  // instead, we capture a copy of the allocation table and work on that. the downside is that we have to malloc() space for a copy.
+  bool capturedCopyOK = false;
+  assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
+  size_t tableSize = AllocationTableSize * sizeof(TaggedAllocationDescriptor);
+  size_t allocCount = AllocationCount;
+  size_t allocSizeTotal = GetTotalSize();
+  // try to allocate space for a copy of the table
   TaggedAllocationDescriptor* allocationTableCopy = static_cast<TaggedAllocationDescriptor*>(malloc(tableSize));
-  memcpy(allocationTableCopy, AllocationTable, tableSize);
-  xSemaphoreGive(AllocationTableMutex);
+  
+  if (allocationTableCopy)
+  {
+    capturedCopyOK = true;
+    memcpy(allocationTableCopy, AllocationTable, tableSize);
+  }
+  xSemaphoreGiveRecursive(AllocationTableMutex);
+
+  if (!capturedCopyOK)
+  {
+    Serial.println("Could not capture allocation table due to malloc failure.");
+    return;
+  }
 
   // print summary
   Serial.print("Allocation count: ");
@@ -316,7 +334,7 @@ void TaggedAlloc::PrintStats()
 
 bool TaggedAlloc::GetFirstEmptySlot(size_t* index)
 {
-  assert(xSemaphoreTake(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME));
+  assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
   
   bool result = false;
   for (size_t n = 0; n < AllocationTableSize; n++)
@@ -329,7 +347,7 @@ bool TaggedAlloc::GetFirstEmptySlot(size_t* index)
     }
   }
   
-  xSemaphoreGive(AllocationTableMutex);
+  xSemaphoreGiveRecursive(AllocationTableMutex);
   return result;
 }
 
@@ -338,7 +356,7 @@ bool TaggedAlloc::GetFirstEmptySlot(size_t* index)
 {
   assert(index);
   
-  assert(xSemaphoreTake(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME));
+  assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
 
   assert(*index < AllocationTableSize);
   
@@ -353,7 +371,7 @@ bool TaggedAlloc::GetFirstEmptySlot(size_t* index)
     }
   }
   
-  xSemaphoreGive(AllocationTableMutex);
+  xSemaphoreGiveRecursive(AllocationTableMutex);
   return result;
 }*/
 
@@ -367,7 +385,7 @@ bool TaggedAlloc::IsAllocationTableFragmented(size_t start, size_t* firstEmptyIn
   assert(firstEmptyIndex);
   assert(firstValidIndex);
   
-  assert(xSemaphoreTake(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME));
+  assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
 
   assert(start < AllocationTableSize);
 
@@ -397,7 +415,7 @@ bool TaggedAlloc::IsAllocationTableFragmented(size_t start, size_t* firstEmptyIn
     entry++;
   }
   
-  xSemaphoreGive(AllocationTableMutex);
+  xSemaphoreGiveRecursive(AllocationTableMutex);
   return fragmented;
 }
 
@@ -405,7 +423,7 @@ bool TaggedAlloc::IsAllocationTableFragmented(size_t start, size_t* firstEmptyIn
 // defragments the allocation table, shifting all descriptors to the top of the table.
 void TaggedAlloc::DefragAllocationTable()
 {
-  assert(xSemaphoreTake(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME));
+  assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
 
   size_t firstEmptyIndex = 0;
   size_t firstValidIndex = 0;
@@ -418,16 +436,16 @@ void TaggedAlloc::DefragAllocationTable()
     AllocationTable[firstValidIndex] = { 0 };
   }
   
-  xSemaphoreGive(AllocationTableMutex);
+  xSemaphoreGiveRecursive(AllocationTableMutex);
 }
 
 
 // resizes the allocation table to the given size.
 void TaggedAlloc::ResizeAllocationTable(size_t newEntryCount)
 {
-  assert(newEntryCount < TAGGED_ALLOC_MIN_TABLE_SIZE);
+  assert(newEntryCount >= TAGGED_ALLOC_MIN_TABLE_SIZE);
   
-  assert(xSemaphoreTake(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME));
+  assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
 
   if (newEntryCount != AllocationTableSize)
   {
@@ -442,14 +460,14 @@ void TaggedAlloc::ResizeAllocationTable(size_t newEntryCount)
     AllocationTableSize = newSize;
   }
   
-  xSemaphoreGive(AllocationTableMutex);
+  xSemaphoreGiveRecursive(AllocationTableMutex);
 }
 
 
 // inserts a new TaggedAllocationDescriptor object into the allocation table, resizing if necessary.
 void TaggedAlloc::InsertAllocation(TaggedAllocationDescriptor ta)
 {
-  assert(xSemaphoreTake(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME));
+  assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
   
   size_t insertIndex = 0;
   if (!GetFirstEmptySlot(&insertIndex))
@@ -465,7 +483,7 @@ void TaggedAlloc::InsertAllocation(TaggedAllocationDescriptor ta)
   AllocationTable[insertIndex] = ta;
   AllocationCount++;
     
-  xSemaphoreGive(AllocationTableMutex);
+  xSemaphoreGiveRecursive(AllocationTableMutex);
 }
 
 
@@ -473,7 +491,7 @@ void TaggedAlloc::InsertAllocation(TaggedAllocationDescriptor ta)
 // this is called by Free()
 void TaggedAlloc::RemoveAllocation(void* objectPointer)
 {
-  assert(xSemaphoreTake(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME));
+  assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
   
   for (size_t n = 0; n < AllocationTableSize; n++)
   {
@@ -497,7 +515,7 @@ void TaggedAlloc::RemoveAllocation(void* objectPointer)
     ResizeAllocationTable(shrunkSize);
   }
   
-  xSemaphoreGive(AllocationTableMutex);
+  xSemaphoreGiveRecursive(AllocationTableMutex);
 }
 
 

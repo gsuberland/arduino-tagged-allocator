@@ -116,11 +116,11 @@ private:
   };
 
   // this is set when Init() is called, to signify that we have initialised OK.
-  static volatile bool InitOK;
+  static bool InitOK;
   // number of active allocations that are present in the table.
-  static volatile size_t AllocationCount;
+  static size_t AllocationCount;
   // the size (in entries, not bytes) of the allocation table.
-  static volatile size_t AllocationTableSize;
+  static size_t AllocationTableSize;
   // the allocation table. this stores the allocation descriptors.
   static TaggedAllocationDescriptor* AllocationTable;
   // mutex for the allocation table.
@@ -165,15 +165,21 @@ public:
     //AllocationTableMutex = xSemaphoreCreateRecursiveMutexStatic(&AllocationTableMutexStatic);
     AllocationTableMutex = xSemaphoreCreateRecursiveMutex();
     assert(AllocationTableMutex);
-    
+
     size_t allocationBufferSize = AllocationTableSize * sizeof(TaggedAllocationDescriptor);
     AllocationTable = static_cast<TaggedAllocationDescriptor*>(malloc(allocationBufferSize));
     assert(AllocationTable);
+    // zero the buffer! this is critical and forgetting to do so caused a bug previously :(
+    memset(AllocationTable, 0, allocationBufferSize);
 
     InitOK = true;
+    
+    assert(heap_caps_check_integrity_all(true));
   }
   
   static size_t GetAllocationCount();
+
+  static size_t GetAllocationTableSize();
 
   static size_t GetTotalSize();
   
@@ -194,9 +200,9 @@ public:
  * Static variable init *
  ************************/
 
-volatile bool TaggedAlloc::InitOK = false;
-volatile size_t TaggedAlloc::AllocationCount = 0;
-volatile size_t TaggedAlloc::AllocationTableSize = TAGGED_ALLOC_INITIAL_TABLE_SIZE;
+bool TaggedAlloc::InitOK = false;
+size_t TaggedAlloc::AllocationCount = 0;
+size_t TaggedAlloc::AllocationTableSize = TAGGED_ALLOC_INITIAL_TABLE_SIZE;
 TaggedAlloc::TaggedAllocationDescriptor* TaggedAlloc::AllocationTable = nullptr;
 SemaphoreHandle_t TaggedAlloc::AllocationTableMutex = nullptr;
 //StaticSemaphore_t TaggedAlloc::AllocationTableMutexStatic;
@@ -237,11 +243,24 @@ size_t TaggedAlloc::GetAllocationCount()
 {
   assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
   
-  volatile size_t count = AllocationCount;
+  size_t count = AllocationCount;
   
   xSemaphoreGiveRecursive(AllocationTableMutex);
 
   return count;
+}
+
+
+// how big is the table?
+size_t TaggedAlloc::GetAllocationTableSize()
+{
+  assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
+  
+  size_t size = AllocationTableSize;
+  
+  xSemaphoreGiveRecursive(AllocationTableMutex);
+
+  return size;
 }
 
 
@@ -269,22 +288,23 @@ size_t TaggedAlloc::GetTotalSize()
 void TaggedAlloc::PrintStats()
 {
   Serial.println("*** TAGGED ALLOCATION STATS ***");
-  Serial.println("> Capturing allocation table...");
+  Serial.println("Capturing allocation table...");
 
   // calls to Serial functions may take a lot of time, so it isn't practical to hold the lock on the descriptor table while we print stats.
   // instead, we capture a copy of the allocation table and work on that. the downside is that we have to malloc() space for a copy.
   bool capturedCopyOK = false;
   assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
-  size_t tableSize = AllocationTableSize * sizeof(TaggedAllocationDescriptor);
+  size_t tableBufferSize = AllocationTableSize * sizeof(TaggedAllocationDescriptor);
+  size_t tableEntryCount = AllocationTableSize;
   size_t allocCount = AllocationCount;
   size_t allocSizeTotal = GetTotalSize();
   // try to allocate space for a copy of the table
-  TaggedAllocationDescriptor* allocationTableCopy = static_cast<TaggedAllocationDescriptor*>(malloc(tableSize));
+  TaggedAllocationDescriptor* allocationTableCopy = static_cast<TaggedAllocationDescriptor*>(malloc(tableBufferSize));
   
   if (allocationTableCopy)
   {
     capturedCopyOK = true;
-    memcpy(allocationTableCopy, AllocationTable, tableSize);
+    memcpy(allocationTableCopy, AllocationTable, tableBufferSize);
   }
   xSemaphoreGiveRecursive(AllocationTableMutex);
 
@@ -298,13 +318,13 @@ void TaggedAlloc::PrintStats()
   Serial.print("Allocation count: ");
   Serial.println(allocCount);
   Serial.print("Table size: ");
-  Serial.print(allocCount);
+  Serial.print(tableEntryCount);
   Serial.print(" (");
-  Serial.print(allocCount * sizeof(TaggedAllocationDescriptor));
+  Serial.print(tableBufferSize);
   Serial.println(" bytes)");
 
   // print allocations
-  for (size_t index = 0; index < tableSize; index++)
+  for (size_t index = 0; index < tableEntryCount; index++)
   {
     TaggedAllocationDescriptor alloc = allocationTableCopy[index];
     if (TAGGED_ALLOC_IS_VALID(alloc))
@@ -447,6 +467,11 @@ void TaggedAlloc::ResizeAllocationTable(size_t newEntryCount)
   
   assert(xSemaphoreTakeRecursive(AllocationTableMutex, TAGGED_ALLOC_WAIT_TIME) == pdTRUE);
 
+  /*Serial.print("Resizing allocation table from ");
+  Serial.print(AllocationTableSize);
+  Serial.print(" to ");
+  Serial.print(newEntryCount);
+  Serial.println(" entries.");*/
   if (newEntryCount != AllocationTableSize)
   {
     if (newEntryCount < AllocationTableSize)
@@ -457,7 +482,18 @@ void TaggedAlloc::ResizeAllocationTable(size_t newEntryCount)
     size_t newSize = newEntryCount * sizeof(TaggedAllocationDescriptor);
     AllocationTable = static_cast<TaggedAllocationDescriptor*>(realloc(AllocationTable, newSize));
     assert(AllocationTable != nullptr);
-    AllocationTableSize = newSize;
+    // zero the new entries if there are any
+    if (newEntryCount > AllocationTableSize)
+    {
+      size_t zeroOffset = AllocationTableSize * sizeof(TaggedAllocationDescriptor);
+      /*Serial.print("Zero offset: ");
+      Serial.println(zeroOffset);*/
+      size_t zeroLength = newSize - zeroOffset;
+      /*Serial.print("Zero length: ");
+      Serial.println(zeroLength);*/
+      memset(AllocationTable + AllocationTableSize, 0, zeroLength);
+    }
+    AllocationTableSize = newEntryCount;
   }
   
   xSemaphoreGiveRecursive(AllocationTableMutex);
@@ -536,6 +572,8 @@ T* TaggedAlloc::AllocateInternal(size_t count, char tag[4])
   // allocate object, and throw an assertion fail if the malloc() call fails
   ta.Object = malloc(ta.Size);
   assert(ta.Object);
+  // zero memory for safety
+  memset(ta.Object, 0, ta.Size);
   // insert the descriptor into the allocation table
   InsertAllocation(ta);
   // done :)
